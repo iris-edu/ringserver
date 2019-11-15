@@ -23,6 +23,9 @@
  * Modified: 2016.354
  **************************************************************************/
 
+ /* _GNU_SOURCE needed to get asprintf() under Linux */
+ #define _GNU_SOURCE
+
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -30,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 
@@ -77,7 +81,7 @@ DLHandleCmd (ClientInfo *cinfo)
   if (!strncmp (cinfo->recvbuf, "WRITE", 5))
   {
     /* Check for write permission */
-    if (!cinfo->writeperm)
+    if (!cinfo->writeperm && !cinfo->jwttoken)
     {
       lprintf (1, "[%s] Data packet received from client without write permission",
                cinfo->hostname);
@@ -567,6 +571,161 @@ HandleNegotiation (ClientInfo *cinfo)
     }
   } /* End of REJECT */
 
+  /* AUTHORIZATION size\r\n[token] - token authorization for write */
+  else if (!strncasecmp (cinfo->recvbuf, "AUTHORIZATION", 13))
+  {
+    /* Parse size from request */
+    fields = sscanf (cinfo->recvbuf, "%*s %d %c", &size, &junk);
+
+    /* Make sure we got a single pattern or no pattern */
+    if (fields > 1)
+    {
+      if (SendPacket (cinfo, "ERROR", "AUTHORIZATION requires a single argument", 0, 1, 1))
+        return -1;
+
+      OKGO = 0;
+    }
+
+    else if (size > DLMAXREGEXLEN)
+    {
+      lprintf (0, "[%s] auth token too large (%)", cinfo->hostname, size);
+
+      snprintf (sendbuffer, sizeof (sendbuffer), "authorization token too large, must be <= %d",
+                DLMAXREGEXLEN);
+      if (SendPacket (cinfo, "ERROR", sendbuffer, 0, 1, 1))
+        return -1;
+
+      OKGO = 0;
+    }
+    else
+    {
+      if ( ! authdir) {
+        lprintf (0, "[%s] cannot authorize for write, auth not configured", cinfo->hostname);
+
+        snprintf (sendbuffer, sizeof (sendbuffer),
+            "[%s] cannot authorize for write, auth not configured", cinfo->hostname);
+        if (SendPacket (cinfo, "ERROR", sendbuffer, 0, 1, 1))
+          return -1;
+
+        OKGO = 0;
+      } else {
+        char *keypath = NULL;
+        char *keyfilename = NULL;
+        struct stat filestat;
+        FILE *fp;
+        unsigned char key[16384];
+        int key_len = 0;
+        char *jwt_str = NULL;
+        jwt_t *jwt = NULL;
+        int ret;
+        if (cinfo->jwttoken)
+          jwt_free( cinfo->jwttoken);
+
+        /* Read regex of size bytes from socket */
+        if (!(jwt_str = (char *)malloc (size + 1)))
+        {
+          lprintf (0, "[%s] Error allocating memory", cinfo->hostname);
+          return -1;
+        }
+
+        if (RecvData (cinfo, jwt_str, size) < 0)
+        {
+          lprintf (0, "[%s] Error Recv'ing data", cinfo->hostname);
+          return -1;
+        }
+
+        /* Make sure buffer is a terminated string */
+        jwt_str[size] = '\0';
+
+        /* read key to verify */
+        if (asprintf (&keypath, "%s/%s", authdir, "secret.key") < 0)
+          return -1;
+
+        keyfilename = realpath (keypath, NULL);
+        if (keyfilename == NULL)
+        {
+          lprintf (0, "Error resolving path to key file: %s", keypath);
+          return -1;
+        }
+
+
+        if (stat (keyfilename, &filestat))
+          return -1;
+        if ((fp = fopen (keyfilename, "r")) == NULL)
+        {
+          lprintf (0, "Error opening key file %s:  %s",
+                   keyfilename, strerror (errno));
+          return -1;
+        }
+        key_len = fread(key, 1, sizeof(key), fp);
+      	fclose(fp);
+        key[key_len] = '\0';
+      	if (key[key_len-1] == '\n') {
+      		//zap newline
+      		key[key_len-1] = '\0';
+      	}
+
+        ret = jwt_new(&jwt);
+        if (ret != 0) {
+          lprintf (0, "Error alloc memory for jwt %d", ret);
+          return -1;
+        }
+
+        // decode with verify secret
+        ret = jwt_decode(&jwt, jwt_str, key, key_len);
+
+        if (ret != 0) {
+            lprintf (0, "[%s] cannot parse/verify auth token %d %s '%s'", cinfo->hostname, ret, strerror (ret), jwt_str);
+            lprintf (0, "%s", jwt_str);
+            lprintf (0, "%s", key);
+
+            snprintf (sendbuffer, sizeof (sendbuffer),
+                "[%s] cannot parse/verify auth token '%s'", cinfo->hostname, jwt_str);
+            if (SendPacket (cinfo, "ERROR", sendbuffer, 0, 1, 1))
+              return -1;
+
+            OKGO = 0;
+            return -1; // kill on auth error?
+        }
+
+        // check expire time
+        time_t currTime = time(NULL);
+        if (currTime >  jwt_get_grant_int(jwt, "exp")) {
+          // jwt_get_grant_int returns 0 is not exist, so no exp => fail
+          lprintf (1, "[%s] Token expired: %d > %d",
+                   cinfo->hostname, currTime, jwt_get_grant_int(jwt, "exp"));
+
+          SendPacket (cinfo, "ERROR", "Token expired", 0, 1, 1);
+          return -1;
+        }
+
+        cinfo->jwttoken = jwt;
+        // no longer need the base64 string
+        free(jwt_str);
+        /* Compile write expression */
+        cinfo->writepatternstr = jwt_get_grant(cinfo->jwttoken, "wpat");
+        lprintf (0, "JWTToken: writepattern: %s", cinfo->writepatternstr);
+
+        const char *errptr;
+        int erroffset;
+        cinfo->writepattern = pcre_compile (cinfo->writepatternstr, 0, &errptr, &erroffset, NULL);
+        if (errptr)
+        {
+          lprintf (0, "JWTToken: Error with pcre_compile: %s (offset: %d)", errptr, erroffset);
+
+          if (SendPacket (cinfo, "ERROR", "Error with jwt write expression", 0, 1, 1))
+            return -1;
+        }
+        else
+        {
+          snprintf (sendbuffer, sizeof (sendbuffer), "auth for write granted");
+          if (SendPacket (cinfo, "OK", sendbuffer, 0, 1, 1))
+            return -1;
+        }
+      }
+    }
+  }
+
   /* BYE - End connection */
   else if (!strncasecmp (cinfo->recvbuf, "BYE", 3))
   {
@@ -618,6 +777,8 @@ HandleWrite (ClientInfo *cinfo)
 
   MSRecord *msr = 0;
   char *type;
+  pcre_extra *match_extra = NULL;
+  int pcre_result = 0;
 
   if (!cinfo)
     return -1;
@@ -634,6 +795,37 @@ HandleWrite (ClientInfo *cinfo)
 
     return -1;
   }
+
+  if (cinfo->jwttoken && cinfo->writepattern) {
+      time_t currTime = time(NULL);
+      if (currTime >  jwt_get_grant_int(cinfo->jwttoken, "exp")) {
+        // jwt_get_grant_int returns 0 is not exist, so no exp => fail
+        lprintf (1, "[%s] Token expired for WRITE streamid: %.100s %d > %d",
+                 cinfo->hostname, streamid, currTime, jwt_get_grant_int(cinfo->jwttoken, "exp"));
+
+        SendPacket (cinfo, "ERROR", "Token expired WRITE streamid", 0, 1, 1);
+        return -1;
+      }
+      pcre_result = pcre_exec (cinfo->writepattern, match_extra, streamid, strlen (streamid), 0, 0, NULL, 0);
+      if(pcre_result<0) {
+          // PCRE_ERROR_NOMATCH=-1
+          lprintf (1, "[%s] Token not auth to WRITE streamid: %.100s  %d",
+                   cinfo->hostname, streamid, pcre_result);
+
+          SendPacket (cinfo, "ERROR", "Token not auth to WRITE streamid", 0, 1, 1);
+          if (match_extra) {
+            pcre_free(match_extra);
+          }
+          return -1;
+      } else {
+          lprintf (3, "[%s] Token auth ok to WRITE streamid: %.100s   %d",
+                   cinfo->hostname, streamid, pcre_result);
+          if (match_extra) {
+             pcre_free(match_extra);
+          }
+      }
+  }
+
 
   /* Copy the stream ID */
   memcpy (cinfo->packet.streamid, streamid, sizeof (cinfo->packet.streamid));
